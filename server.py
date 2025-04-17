@@ -10,16 +10,22 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from typing import Dict
+from concurrent.futures import ProcessPoolExecutor
 import argparse
 
 from pyvirtualdisplay import Display
 import uvicorn
 import atexit
+import asyncio
+import logging
 
 # Check if running in Docker mode
 DOCKER_MODE = os.getenv("DOCKERMODE", "false").lower() == "true"
 
 SERVER_PORT = int(os.getenv("SERVER_PORT", 8000))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Chromium options arguments
 arguments = [
@@ -37,11 +43,26 @@ arguments = [
     "-deny-permission-prompts",
     "-disable-gpu",
     "-accept-lang=en-US",
-    #"-incognito" # You can add this line to open the browser in incognito mode by default 
+    "-incognito" # You can add this line to open the browser in incognito mode by default 
+    "--disable-web-security",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--disable-site-isolation-trials",
+    "--ignore-certificate-errors",
+    "--ignore-ssl-errors=yes",
+    "--disable-dev-shm-usage",
+    "--disable-infobars",
+    "--disable-browser-side-navigation",
+    "--disable-features=TranslateUI",
+    "--disable-extensions",
+    "--disable-component-extensions-with-background-pages",
+    "--disable-default-apps",
+    "--no-default-browser-check",
 ]
 
 browser_path = "/usr/bin/google-chrome"
 app = FastAPI()
+# Set up a process pool for concurrency
+executor = ProcessPoolExecutor(max_workers=100)  # Adjust based on your hardware
 
 
 # Pydantic model for the response
@@ -142,9 +163,13 @@ def bypass_cloudflare(url: str, retries: int, log: bool, proxy: str = None) -> C
     options = ChromiumOptions().auto_port()
     options.set_paths(browser_path=browser_path).headless(False)
 
+    # Add additional timeout settings
+    options.set_argument("--timeout=30000")
+    options.set_timeouts(page_load=60000, script=60000)
+
     if DOCKER_MODE:
         options.set_argument("--auto-open-devtools-for-tabs", "true")
-        #options.set_argument("--remote-debugging-port=9222")
+        # options.set_argument("--remote-debugging-port=9222")
         options.set_argument("--no-sandbox") # Necessary for Docker
         options.set_argument("--disable-gpu") # Optional, helps in some cases
     
@@ -178,16 +203,43 @@ def bypass_cloudflare(url: str, retries: int, log: bool, proxy: str = None) -> C
             print(f"Error parsing proxy string '{proxy}': {e}. Proceeding without proxy.")
             raise HTTPException(status_code=400, detail=str(e))
 
+    # Implement better retry logic
+    for attempt in range(retries):
+        driver = ChromiumPage(addr_or_opts=options)
+        try:
+            driver.get(url, timeout=60)  # Increase timeout
+            cf_bypasser = CloudflareBypasser(driver, retries, log)
+            cf_bypasser.bypass()
+            return driver
+        except DrissionPage.errors.PageDisconnectedError as e:
+            driver.quit()
+            if attempt == retries - 1:
+                raise e
+            time.sleep(2 * (attempt + 1))  # Exponential backoff
+        except Exception as e:
+            driver.quit()
+            raise e
 
-    driver = ChromiumPage(addr_or_opts=options)
+def bypass_cloudflare_worker(url: str, retries: int, log: bool, proxy: str = None):
+    # All browser work happens here
+    driver = None
     try:
-        driver.get(url)
-        cf_bypasser = CloudflareBypasser(driver, retries, log)
-        cf_bypasser.bypass()
-        return driver
-    except Exception as e:
-        driver.quit()
-        raise e
+        driver = bypass_cloudflare(url, retries, log, proxy)
+        html = driver.html
+        cookies = {cookie.get("name", ""): cookie.get("value", " ") for cookie in driver.cookies()}
+        user_agent = driver.user_agent
+        return {"html": html, "cookies": cookies, "user_agent": user_agent}
+    finally:
+        if driver:
+            driver.quit()
+
+
+async def run_bypass_cloudflare(url: str, retries: int, log: bool, proxy: str = None):
+    loop = asyncio.get_event_loop()
+    driver = await loop.run_in_executor(
+        executor, bypass_cloudflare_worker, url, retries, log, proxy
+    )
+    return driver
 
 
 # Endpoint to get cookies
@@ -209,17 +261,16 @@ async def get_cookies(url: str, retries: int = 5, proxy: str = None):
 @app.get("/html")
 async def get_html(url: str, retries: int = 5, proxy: str = None):
     if not is_safe_url(url):
+        logger.error(f"Unsafe URL: {url}")
         raise HTTPException(status_code=400, detail="Invalid URL")
     try:
-        driver = bypass_cloudflare(url, retries, log, proxy)
-        html = driver.html
-        cookies_json = {cookie.get("name", ""): cookie.get("value", " ") for cookie in driver.cookies()}
-        response = Response(content=html, media_type="text/html")
-        response.headers["cookies"] = json.dumps(cookies_json)
-        response.headers["user_agent"] = driver.user_agent
-        driver.quit()
+        result = await run_bypass_cloudflare(url, retries, log, proxy)
+        response = Response(content=result["html"], media_type="text/html")
+        response.headers["cookies"] = json.dumps(result["cookies"])
+        response.headers["user_agent"] = result["user_agent"]
         return response
     except Exception as e:
+        logger.error(f"Error in /html for url={url}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
